@@ -7,3 +7,5 @@ skipped.csv
 .cache/
 *.log
 *.tmp
+errors.csv
+overlaps.csv

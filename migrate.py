@@ -5,7 +5,9 @@ Tasks become Jibble activities named "Project: Task". Billable flags, tags and
 workspace/project/task/per-entry rates are not migrated: Jibble has no field for them.
 
   migrate.py export            read Clockify into export.json (read-only)
-  migrate.py plan              compare with Jibble, write plan.json (read-only)
+  migrate.py plan [--skip-overlaps]
+                               compare with Jibble, write plan.json (read-only); overlapping entries are moved,
+                               at full length, to the next free slot; --skip-overlaps skips them instead
   migrate.py apply [--limit N] [--only-person EMAIL]
                                create what plan.json lists; resumable via state.json
 
@@ -17,9 +19,11 @@ import collections, csv, hashlib, json, os, shutil, ssl, sys, time, uuid, urllib
 from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-EXPORT, PLAN, STATE, SKIPPED, CACHE = (os.path.join(HERE, f) for f in
-                                        ("export.json", "plan.json", "state.json", "skipped.csv", ".cache"))
+EXPORT, PLAN, STATE, SKIPPED, ERRORS, OVERLAPS, CACHE = (os.path.join(HERE, f) for f in
+                                                       ("export.json", "plan.json", "state.json", "skipped.csv",
+                                                        "errors.csv", "overlaps.csv", ".cache"))
 MIN_DATE = "2020-01-01"  # Jibble rejects older time entries (time_entry_before_minimum_date)
+TOO_OLD = f"before {MIN_DATE} (Jibble minimum)"
 NS = uuid.UUID("6f1c2b1e-8a43-4f0e-9a3b-2c6e5d1a7b90")  # deterministic Jibble ids from Clockify ids
 
 JIBBLE_ID = "https://identity.prod.jibble.io/connect/token"
@@ -235,33 +239,73 @@ def shift(ts, seconds):
     return t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def write_skipped_csv(ex, plan, pname):
+def write_skip_reports(ex, plan, pname):
     users = {u["id"]: u for u in ex["users"]}
     clients = {c["id"]: c["name"] for c in ex["clients"]}
     pclient = {p["id"]: clients.get(p.get("clientId"), "") for p in ex["projects"]}
     tasks = {t["id"]: t["name"] for t in ex.get("tasks", [])}
     by_id = {e["id"]: e for e in ex["timeEntries"]}
-    with open(SKIPPED, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["reason", "email", "name", "client", "project", "task", "start", "end", "hours",
-                    "description", "billable", "hourly_rate", "currency", "clockify_id"])
+    header = ["reason", "email", "name", "client", "project", "task", "start", "end", "hours",
+              "description", "billable", "hourly_rate", "currency", "clockify_id"]
+    # skipped.csv: entries older than Jibble accepts; errors.csv: other data problems; overlaps go to overlaps.csv.
+    overlap_ids = {o["id"] for o in plan["overlaps"]}
+    n = collections.Counter()
+    with open(SKIPPED, "w", newline="") as fs, open(ERRORS, "w", newline="") as fe:
+        out = {True: csv.writer(fs), False: csv.writer(fe)}
+        for w in out.values():
+            w.writerow(header)
         for s in sorted(plan["skipped"], key=lambda s: (by_id[s["id"]]["timeInterval"]["start"])):
+            if s["id"] in overlap_ids:
+                continue
             e = by_id[s["id"]]
             ti, u, r = e["timeInterval"], users.get(e["userId"], {}), e.get("hourlyRate") or {}
-            w.writerow([s["reason"].split(" ending")[0], u.get("email"), u.get("name"),
-                        pclient.get(e.get("projectId"), ""), pname.get(e.get("projectId"), ""),
-                        tasks.get(e.get("taskId"), ""), ti["start"], ti.get("end"),
-                        round(hours(ti["start"], ti["end"]), 4) if ti.get("end") else "",
-                        e.get("description"), e.get("billable"),
-                        r["amount"] / 100 if r.get("amount") is not None else "", r.get("currency"), e["id"]])
-    print(f"skipped entries -> {SKIPPED}")
+            old = s["reason"] == TOO_OLD
+            n[old] += 1
+            out[old].writerow([s["reason"].split(" ending")[0], u.get("email"), u.get("name"),
+                               pclient.get(e.get("projectId"), ""), pname.get(e.get("projectId"), ""),
+                               tasks.get(e.get("taskId"), ""), ti["start"], ti.get("end"),
+                               round(hours(ti["start"], ti["end"]), 4) if ti.get("end") else "",
+                               e.get("description"), e.get("billable"),
+                               r["amount"] / 100 if r.get("amount") is not None else "", r.get("currency"), e["id"]])
+    print(f"skipped entries -> {SKIPPED} ({n[True]} before {MIN_DATE}), {ERRORS} ({n[False]} with data problems)")
+    with open(OVERLAPS, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["status", "reason", "email", "name", "client", "project", "task", "start", "end", "new_start", "new_end",
+                    "moved_by_hours", "hours", "description", "clockify_id"])
+        for o in sorted(plan["overlaps"], key=lambda o: by_id[o["id"]]["timeInterval"]["start"]):
+            e = by_id[o["id"]]
+            ti, u = e["timeInterval"], users.get(e["userId"], {})
+            w.writerow([o["status"], o.get("reason", ""), u.get("email"), u.get("name"), pclient.get(e.get("projectId"), ""),
+                        pname.get(e.get("projectId"), ""), tasks.get(e.get("taskId"), ""), ti["start"], ti["end"],
+                        o.get("start", ""), o.get("end", ""),
+                        round(hours(ti["start"], o["start"]), 4) if o.get("start") else "",
+                        round(hours(ti["start"], ti["end"]), 4), e.get("description"), e["id"]])
+    st = collections.Counter(o["status"] for o in plan["overlaps"])
+    print(f"overlapping entries -> {OVERLAPS} ({st['moved']} moved to the next free slot, {st['skipped']} skipped)")
 
 
 def norm(s):
     return (s or "").strip().casefold()
 
 
-def cmd_plan():
+def free_slot(kept, start, end, limit):
+    """Earliest slot at or after `start` that fits the entry's full length, 1 s clear of `kept`;
+    None if it would end after `limit` (the export time), where live Jibble tracking may already be."""
+    one = timedelta(seconds=1)
+    s, dur = parse_ts(start), parse_ts(end) - parse_ts(start)
+    while True:
+        clash = [k for k in kept if k[0] - one < s + dur and s < k[1] + one]
+        if not clash:
+            break
+        s = max(k[1] for k in clash) + one
+    if s + dur > limit:
+        return None
+    kept.append((s, s + dur))
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    return s.astimezone(timezone.utc).strftime(fmt), (s + dur).astimezone(timezone.utc).strftime(fmt)
+
+
+def cmd_plan(move_overlaps=True):
     ex = json.load(open(EXPORT))
     j = Jibble()
     j_people = j.all(JIBBLE_WS, "People")
@@ -278,7 +322,7 @@ def cmd_plan():
     act_by_name = {norm(a["name"]): a for a in j_acts}
 
     ws_rate = ex["workspace"].get("hourlyRate") or {}
-    plan = {"clients": [], "projects": [], "activities": [], "people": [], "entries": [], "skipped": [],
+    plan = {"clients": [], "projects": [], "activities": [], "people": [], "entries": [], "skipped": [], "overlaps": [],
             "currency": {"clockify": ws_rate.get("currency"),
                          "jibble": org.get("IClientBillingSettings/CurrencyCode")}}
     cmap = {}
@@ -332,7 +376,8 @@ def cmd_plan():
                                "rate": member_rate(u),
                                "jibbleRate": hit.get("IPersonSetting/BillableRate") if hit else None})
 
-    # Jibble keeps one In/Out stream per person, so overlapping Clockify entries cannot both go in.
+    # Jibble keeps one In/Out stream per person: entries overlapping an earlier one are moved to a free slot
+    # (or skipped with --skip-overlaps).
     per_user = {}
     for e in ex["timeEntries"]:
         ti = e.get("timeInterval") or {}
@@ -343,20 +388,26 @@ def cmd_plan():
             plan["skipped"].append({"id": e["id"], "reason": "user not in Clockify user list"})
             continue
         per_user.setdefault(e["userId"], []).append(e)
+    def add(e, uid, s, t):
+        plan["entries"].append({"clockifyId": e["id"], "personId": umap[uid], "start": s, "end": t,
+                                "projectId": pmap.get(e.get("projectId")),
+                                "activityId": amap.get(e.get("taskId")),
+                                "note": (e.get("description") or "")[:500]})
+
+    exported_at = datetime.fromisoformat(ex["exportedAt"])
     for uid, es in per_user.items():
         es.sort(key=lambda e: e["timeInterval"]["start"])
-        last_end = ""
+        last_end, kept, overlaps = "", [], []
         for e in es:
             s, t = e["timeInterval"]["start"], e["timeInterval"]["end"]
+            if s < MIN_DATE:
+                plan["skipped"].append({"id": e["id"], "reason": TOO_OLD})
+                continue
             if s >= t:
                 plan["skipped"].append({"id": e["id"], "reason": "zero or negative duration"})
                 continue
-            if s < MIN_DATE:
-                plan["skipped"].append({"id": e["id"], "reason": f"before {MIN_DATE} (Jibble minimum)"})
-                continue
             if s < last_end:
-                plan["skipped"].append({"id": e["id"], "reason": f"overlaps previous entry ending {last_end}",
-                                        "start": s, "end": t, "user": uid, "description": e.get("description")})
+                overlaps.append((e, last_end))
                 continue
             # Jibble rejects a clock-in at the same second as the previous clock-out.
             if s == last_end:
@@ -365,12 +416,22 @@ def cmd_plan():
                     plan["skipped"].append({"id": e["id"], "reason": "zero or negative duration"})
                     continue
             last_end = t
-            plan["entries"].append({"clockifyId": e["id"], "personId": umap[uid], "start": s, "end": t,
-                                    "projectId": pmap.get(e.get("projectId")),
-                                    "activityId": amap.get(e.get("taskId")),
-                                    "note": (e.get("description") or "")[:500]})
+            kept.append((parse_ts(s), parse_ts(t)))
+            add(e, uid, s, t)
+        for e, prev_end in overlaps:
+            if not move_overlaps:
+                plan["skipped"].append({"id": e["id"], "reason": f"overlaps previous entry ending {prev_end}"})
+                plan["overlaps"].append({"id": e["id"], "status": "skipped", "reason": "--skip-overlaps"})
+                continue
+            slot = free_slot(kept, e["timeInterval"]["start"], e["timeInterval"]["end"], exported_at)
+            if not slot:
+                plan["skipped"].append({"id": e["id"], "reason": "overlaps, no free slot before the export time"})
+                plan["overlaps"].append({"id": e["id"], "status": "skipped", "reason": "no free slot before the export time"})
+                continue
+            plan["overlaps"].append({"id": e["id"], "status": "moved", "start": slot[0], "end": slot[1]})
+            add(e, uid, *slot)
     write_json(PLAN, plan, indent=1)
-    write_skipped_csv(ex, plan, pname)
+    write_skip_reports(ex, plan, pname)
 
     def n(kind, exists):
         return sum(1 for x in plan[kind] if x["exists"] == exists)
@@ -454,11 +515,17 @@ def cmd_apply(limit=None, only_email=None):
             sys.exit(f"{only_email} is not in the plan")
         entries = [e for e in entries if e["personId"] == pid]
     todo = [e for e in entries if f"out:{e['clockifyId']}" not in state["done"]]
-    if limit:
+    if limit is not None:
         todo = todo[:limit]
+    projects = j.all(JIBBLE_WS, "Projects", **{"$select": "id,assignees,status"})
     # Jibble refuses clock-ins on a project with assignees unless the person is one of them.
-    assignees = {p["id"]: [a["unitId"] for a in p.get("assignees") or []]
-                 for p in j.all(JIBBLE_WS, "Projects", **{"$select": "id,assignees"})}
+    assignees = {p["id"]: [a["unitId"] for a in p.get("assignees") or []] for p in projects}
+    # It also refuses them on archived projects and activities, so collect the archived ones this script created.
+    archived = {p["id"]: "Projects" for p in projects if p.get("status") == "Archived"}
+    archived.update({a["id"]: "Activities" for a in j.all(JIBBLE_WS, "Activities", **{"$select": "id,status"})
+                     if a.get("status") == "Archived"})
+    ours = {x["jibbleId"] for k, kind in (("projects", "project"), ("activities", "activity"))
+            for x in plan[k] if x["jibbleId"] == jid(kind, x["clockifyId"])}
 
     def assign(project_id, person_id, restrict=False):
         key = f"assign:{project_id}:{person_id}"
@@ -498,30 +565,50 @@ def cmd_apply(limit=None, only_email=None):
                                          if e["projectId"] and f"in:{e['clockifyId']}" in state["done"]}):
         assign(project_id, person_id)
 
+    def set_status(oid, status):
+        st, _, resp = j.patch(JIBBLE_WS, f"{archived[oid]}/{oid}", {"status": status})
+        if st in (200, 204):
+            state["errors"].pop(f"status:{oid}", None)
+            return True
+        state["errors"][f"status:{oid}"] = f"set {status}: {st}: {str(resp)[:400]}"
+        print(f"  FAIL setting {archived[oid]}/{oid} to {status}: {st} {str(resp)[:300]}", file=sys.stderr)
+        return False
+
+    # Reopen archived projects and activities that still have entries to import; archive them again
+    # when the run ends, even if it is interrupted.
+    reopened = [oid for oid in sorted({i for e in todo for i in (e["projectId"], e.get("activityId")) if i})
+                if oid in archived and oid in ours and set_status(oid, "Active")]
+    if reopened:
+        print(f"reopened {len(reopened)} archived projects/activities for this run")
     print(f"time entries: {len(todo)} to go")
-    for i, e in enumerate(todo, 1):
-        cid = e["clockifyId"]
-        if e["projectId"] and not assign(e["projectId"], e["personId"]):
-            continue
-        inn = {"id": jid("in", cid), "personId": e["personId"], "type": "In", "time": e["start"],
-               "clientType": "Web", "platform": PLATFORM}
-        if e["projectId"]:
-            inn["projectId"] = e["projectId"]
-        if e.get("activityId"):
-            inn["activityId"] = e["activityId"]
-        if e["note"]:
-            inn["note"] = e["note"]
-        out = {"id": jid("out", cid), "personId": e["personId"], "type": "Out", "time": e["end"],
-               "clientType": "Web", "platform": PLATFORM}
-        if create(f"in:{cid}", JIBBLE_TT, "TimeEntries", inn):
-            create(f"out:{cid}", JIBBLE_TT, "TimeEntries", out)
-        if i % 25 == 0:
-            save()
-            print(f"  {i}/{len(todo)}")
-    save()
+    try:
+        for i, e in enumerate(todo, 1):
+            cid = e["clockifyId"]
+            if e["projectId"] and not assign(e["projectId"], e["personId"]):
+                continue
+            inn = {"id": jid("in", cid), "personId": e["personId"], "type": "In", "time": e["start"],
+                   "clientType": "Web", "platform": PLATFORM}
+            if e["projectId"]:
+                inn["projectId"] = e["projectId"]
+            if e.get("activityId"):
+                inn["activityId"] = e["activityId"]
+            if e["note"]:
+                inn["note"] = e["note"]
+            out = {"id": jid("out", cid), "personId": e["personId"], "type": "Out", "time": e["end"],
+                   "clientType": "Web", "platform": PLATFORM}
+            if create(f"in:{cid}", JIBBLE_TT, "TimeEntries", inn):
+                create(f"out:{cid}", JIBBLE_TT, "TimeEntries", out)
+            if i % 25 == 0:
+                save()
+                print(f"  {i}/{len(todo)}")
+    finally:
+        save()
+        for oid in reopened:
+            set_status(oid, "Archived")
+        save()
 
     # Archive projects archived in Clockify and activities from done tasks, once their entries are in.
-    if not limit and not only_email:
+    if limit is None and not only_email:
         pending = {i for e in plan["entries"] if f"out:{e['clockifyId']}" not in state["done"]
                    for i in (e["projectId"], e.get("activityId")) if i}
         targets = [("Projects", "project", p) for p in plan["projects"] if p["archived"]] + \
@@ -538,7 +625,7 @@ def cmd_apply(limit=None, only_email=None):
                     state["errors"][key] = f"{st}: {str(resp)[:400]}"
         save()
     ids = {x["clockifyId"] for k in ("clients", "projects", "activities", "people", "entries") for x in plan[k]}
-    current = sum(1 for k in state["errors"] if k.startswith("assign:") or k.split(":", 1)[1] in ids)
+    current = sum(1 for k in state["errors"] if k.startswith(("assign:", "status:")) or k.split(":", 1)[1] in ids)
     stale = len(state["errors"]) - current
     print(f"done: {len(state['done'])} objects, errors: {current}" +
           (f" (+{stale} for items no longer in the plan)" if stale else "") + f" (see {STATE})")
@@ -549,11 +636,21 @@ if __name__ == "__main__":
     a = sys.argv[1:]
     if not a or a[0] not in ("export", "plan", "apply"):
         sys.exit(__doc__)
+    flags = {"export": set(), "plan": {"--skip-overlaps"}, "apply": {"--limit", "--only-person"}}[a[0]]
+    takes_value = {"--limit", "--only-person"}
+    rest = a[1:]
+    while rest:
+        if rest[0] not in flags or (rest[0] in takes_value and len(rest) < 2):
+            sys.exit(f"unknown or incomplete option {rest[0]!r} for {a[0]}\n\n{__doc__}")
+        rest = rest[2:] if rest[0] in takes_value else rest[1:]
     if a[0] == "export":
         cmd_export()
     elif a[0] == "plan":
-        cmd_plan()
+        cmd_plan(move_overlaps="--skip-overlaps" not in a)
     else:
-        lim = int(a[a.index("--limit") + 1]) if "--limit" in a else None
+        lim = a[a.index("--limit") + 1] if "--limit" in a else None
+        if lim is not None and not lim.isdigit():
+            sys.exit(f"--limit needs a whole number, got {lim!r}")
+        lim = int(lim) if lim is not None else None
         only = a[a.index("--only-person") + 1] if "--only-person" in a else None
         cmd_apply(lim, only)
