@@ -1,0 +1,9 @@
+.env
+state.json
+state.before-resume.json
+export.json
+plan.json
+skipped.csv
+.cache/
+*.log
+*.tmp
